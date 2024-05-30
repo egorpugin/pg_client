@@ -20,6 +20,8 @@ deps:
 #include <tidy.h>
 #include <tidybuffio.h>
 
+#include <algorithm>
+#include <ranges>
 #include <format>
 #include <print>
 
@@ -57,56 +59,98 @@ std::string get_content(pugi::xml_node from) {
     throw SW_RUNTIME_ERROR("unknown node type");
 }
 
+auto prepare_string(auto s) {
+    // comes from <a>
+    if (s.ends_with('#')) {
+        s.pop_back();
+    }
+    boost::replace_all(s, "SSL", "Ssl");
+    boost::replace_all(s, "SASL", "Sasl");
+    boost::replace_all(s, "SSPI", "Sspi");
+    boost::replace_all(s, "GSSENC", "Gssenc");
+    boost::replace_all(s, "GSSAPI", "Gssapi");
+    boost::replace_all(s, "GSS", "Gss");
+    boost::replace_all(s, "MD5", "Md5");
+    boost::replace_all(s, "ID", "Id");
+    boost::replace_all(s, "\n", "");
+    //boost::replace_all(s, "'", "");
+    return s;
+}
+
 struct field {
     std::string type;
     std::string comment;
 
     auto emit() const {
-        std::string s;
-        s += std::format("    {} {};\n", type, c_name());
-        return s;
-    }
-    std::string c_type() const {
-        std::string s;
-        for (int i = 0; auto c : type) {
-            if (c == ' ') {
-                break;
+        auto type = prepare_string(this->type);
+
+        auto get_val = [&]() {
+            std::string s;
+            auto p = type.find('(');
+            if (p == -1) {
+                return s;
             }
-            if (isupper(c)) {
-                c = tolower(c);
-                if (i) {
-                    s += '_';
+            return "{" + type.substr(p + 1, type.find(')') - (p+1)) + "}";
+        };
+
+        auto v = get_val();
+        std::string s;
+        if (type.starts_with("Byte")) {
+            try {
+                auto bytes = std::stoi(type.substr(4));
+                if (bytes == 1) {
+                    s += std::format("    i8 {}{};\n", c_name(), v);
+                } else {
+                    s += std::format("    i8 {}[{}];\n", c_name(), bytes);
                 }
-                s += c;
-            } else {
-                s += c;
+            } catch (std::exception &e) {
+                s += std::format("    i8 *{};\n", c_name());
             }
-            ++i;
+        } else if (type.starts_with("Int")) {
+            auto bits = std::stoi(type.substr(3));
+            s += std::format("    i{} {}{};\n", bits, c_name(), v);
+        } else if (type.starts_with("String")) {
+            s += std::format("    std::string {}{};\n", c_name(), v);
+        } else {
+            throw std::runtime_error{"unknown type"};
         }
+        boost::replace_all(s, "__", "_");
         return s;
     }
     std::string c_name() const {
+        auto comment = prepare_string(this->comment);
+
         std::string s;
         if (comment.starts_with("Identifies the message"sv)) {
-            return "id"s;
+            return "type"s;
         }
-        if (comment.starts_with("Length"sv)) {
+        if (comment.starts_with("Length of message contents"sv)) {
             return "length"s;
         }
+        if (comment.starts_with("Length"sv)) {
+            return "length2"s;
+        }
+        if (comment.starts_with("Specifies that"sv)) {
+            return "auth_type"s;
+        }
         for (int i = 0; auto c : comment) {
-            if (c == ' ') {
-                break;
-            }
-            if (isupper(c)) {
+            if (c >= 'A' && c <= 'Z') {
                 c = tolower(c);
                 if (i) {
                     s += '_';
                 }
                 s += c;
-            } else {
+            } else if (c >= 'a' && c <= 'z' || c >= '0' && c <= '9') {
                 s += c;
+            } else if (c == '.') {
+                break;
+            } else {
+                s += '_';
             }
             ++i;
+        }
+        if (s.empty() || isdigit(s.front())) {
+            s = "_" + s;
         }
         return s;
     }
@@ -116,15 +160,34 @@ struct type {
     std::vector<field> fields;
 
     auto emit() const {
+        auto name = prepare_string(this->name);
+
         std::string s;
         s += std::format("struct {} {{\n", c_name());
-        for (auto &&f : fields) {
+        bool fe{};
+        if (name.contains("(B)"sv)) {
+            s += std::format("    static constexpr inline bool backend_type = true;\n", c_name());
+        } else if (name.contains("(F)"sv)) {
+            fe = true;
+            s += std::format("    static constexpr inline bool frontend_type = true;\n", c_name());
+        } else if (name.contains("(F & B)"sv)) {
+            fe = true;
+            s += std::format("    static constexpr inline bool backend_type  = true;\n", c_name());
+            s += std::format("    static constexpr inline bool frontend_type = true;\n", c_name());
+        }
+        s += "\n";
+        for (auto &&f : fields
+            //| std::views::drop(fe ? 0 : 0)
+            //| std::views::take(2)
+            ) {
             s += f.emit();
         }
-        s += std::format("}};\n\n");
+        s += std::format("}};\n");
         return s;
     }
     std::string c_name() const {
+        auto name = prepare_string(this->name);
+
         std::string s;
         for (int i = 0; auto c : name) {
             if (c == ' ') {
@@ -166,17 +229,11 @@ struct parser {
             auto n = x.node();
             auto &t = ts.emplace_back();
             t.name = get_content(n);
-            // comes from <a>
-            if (t.name.ends_with('#')) {
-                t.name.pop_back();
-            }
             for (auto &&x : n.next_sibling().select_nodes(pugi::xpath_query{"div/dl/dt"})) {
                 auto n = x.node();
                 auto &f = t.fields.emplace_back();
                 f.type = get_content(n);
-                boost::replace_all(f.type, "\n", "");
                 f.comment = get_content(n.next_sibling());
-                boost::replace_all(f.comment, "\n", "");
             }
         }
         return ts;
@@ -186,13 +243,18 @@ struct parser {
 int main(int argc, char *argv[]) {
     parser p;
     auto ts = p.parse();
+    std::string raw, c;
     for (auto &&t : ts) {
-        std::println("{}", t.name);
+        raw += std::format("{}\n", t.name);
         for (auto &&f : t.fields) {
-            std::println("\t{}", f.type);
-            std::println("\t\t{}", f.comment);
+            raw += std::format("\t{}\n", f.type);
+            raw += std::format("\t\t{}\n", f.comment);
         }
-        std::println("{}", t.emit());
+        raw += "\n";
+        c += std::format("{}\n", t.emit());
     }
+    write_file("raw.txt", raw);
+    write_file("pg_protocol_messages.h", c);
+    write_file("pg_messages.h", c);
     return 0;
 }
