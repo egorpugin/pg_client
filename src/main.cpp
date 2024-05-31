@@ -1,6 +1,7 @@
 #include <boost/asio.hpp>
 #include <primitives/sw/main.h>
-#include <primitives/templates2/string.h>
+#include <primitives/templates2/base64.h>
+#include <hmac.h>
 
 #include <string>
 #include <variant>
@@ -19,8 +20,11 @@ struct pg_connection {
     pg_connection(boost::asio::io_context &ctx, auto &&connstr) {
         auto vec = split_string(connstr, " ");
         for (auto &&v : vec) {
-            auto kv = split_string(v, "=");
-            params[kv.at(0)] = kv.at(1);
+            auto p = v.find('=');
+            if (p == -1) {
+                continue;
+            }
+            params[v.substr(0,p)] = v.substr(p+1);
         }
         boost::asio::co_spawn(ctx, start(), boost::asio::detached);
     }
@@ -50,173 +54,165 @@ struct pg_connection {
         length = std::byteswap(length);
 
         co_await s.async_send(buffers, boost::asio::use_awaitable);
+        co_await auth(s);
 
-        auto msg = co_await auth<
-            //error_response,
-            authentication_kerberos_v5,
-            authentication_cleartext_password,
-            authentication_md5_password,
-            authentication_gss,
-            authentication_sspi,
-            authentication_sasl
-        >(s);
+        while (1) {
+            auto m = co_await get_message(s);
+            if (ready_for_query{}.type == m.h.type) {
+                break;
+            }
+        }
 
         int a = 5;
         a++;
     }
-    template <typename ... Types>
-    task<std::variant<Types...>> auth(ip::tcp::socket &s) {
+    task<> auth(ip::tcp::socket &s) {
+        auto m = co_await get_message<authentication_ok>(s);
+        auto &a = m.get<authentication_ok>();
+        switch (std::byteswap(a.auth_type)) {
+        case authentication_sasl{}.auth_type: {
+            auto &a = m.get<authentication_sasl>();
+            auto type = a.authentication_mechanism().at(0);
+            if (type != "SCRAM-SHA-256"sv) {
+                throw std::runtime_error{"unknown sasl: "s};
+            }
+            std::string r;
+            r.resize(18, '0');
+            std::string str;
+            // pg ignores user and libpq sends empty username
+            str += "n,,n=,r=" + base64::encode(r);
+
+            sasl_initial_response resp{};
+            std::vector<boost::asio::const_buffer> buffers;
+            buffers.emplace_back(&resp, sizeof(resp));
+            buffers.emplace_back(type.data(), type.size() + 1);
+            int len = str.size();
+            len = std::byteswap(len);
+            buffers.emplace_back(&len, sizeof(len));
+            buffers.emplace_back(str.data(), str.size());
+            for (auto &&b : buffers) {
+                resp.length += b.size();
+            }
+            --resp.length;
+            resp.length = std::byteswap(resp.length);
+            co_await s.async_send(buffers, boost::asio::use_awaitable);
+            auto sc = co_await get_auth_message<authentication_sasl_continue>(s);
+            auto &asc = sc.get<authentication_sasl_continue>();
+            auto sd = asc.server_data();
+            std::map<std::string, std::string> params;
+            auto vec = split_string(std::string{sd}, ",");
+            for (auto &&v : vec) {
+                auto p = v.find('=');
+                if (p == -1) {
+                    continue;
+                }
+                params[v.substr(0,p)] = v.substr(p+1);
+            }
+
+            // https://www.rfc-editor.org/rfc/rfc5802
+            using namespace crypto;
+            auto salt = base64::decode(params.at("s"));
+            auto Hi = [](auto &&pass, auto &&salt, auto &&i) {
+                int i1{1};
+                i1 = std::byteswap(i1);
+                salt.resize(salt.size() + 4);
+                memcpy(salt.data() + salt.size() - 4, &i1, 4);
+                auto u = hmac<sha256>(pass, salt);
+                --i;
+                auto hi = u;
+                auto len = hi.size();
+                while (i--) {
+                    u = hmac<sha256>(pass, u);
+                    for (int i = 0; i < len; ++i) {
+                        hi[i] ^= u[i];
+                    }
+                }
+                return hi;
+            };
+            auto salted_password = Hi(this->params["password"], salt, std::stoi(std::string{params.at("i")}));
+            auto client_key = hmac<sha256>(salted_password, "Client Key"sv);
+            auto server_key = hmac<sha256>(salted_password, "Server Key"sv);
+            sha256 sha;
+            sha.update(client_key);
+            auto stored_key = sha.digest();
+            auto new_client = "c=" + base64::encode("n,,"s) + ",r=" + params.at("r");
+            // pg (and libpq) uses empty user (n=) because username is already sent
+            auto auth_message = "n=,r=" + base64::encode(r) + ","s + std::string{sd} + ","s + new_client;
+            auto client_signature = hmac<sha256>(stored_key, auth_message);
+            auto server_signature = hmac<sha256>(server_key, auth_message);
+            auto client_proof = client_key;
+            len = client_proof.size();
+            for (int i = 0; i < len; ++i) {
+                client_proof[i] ^= client_signature[i];
+            }
+            new_client += ",p=" + base64::encode(client_proof);
+
+            sasl_response resp2{};
+            buffers.clear();
+            buffers.emplace_back(&resp2, sizeof(resp2));
+            buffers.emplace_back(new_client.data(), new_client.size());
+            resp2.length = sizeof(resp2.length) + new_client.size();
+            resp2.length = std::byteswap(resp2.length);
+            co_await s.async_send(buffers, boost::asio::use_awaitable);
+            auto scf = co_await get_auth_message<authentication_sasl_final>(s);
+            auto &asf = scf.get<authentication_sasl_final>();
+            sd = asf.server_data();
+            vec = split_string(std::string{sd}, ",");
+            for (auto &&v : vec) {
+                auto p = v.find('=');
+                if (p == -1) {
+                    continue;
+                }
+                params[v.substr(0,p)] = v.substr(p+1);
+            }
+            len = server_signature.size();
+            auto verifier = base64::decode(params.at("v"));
+            if (verifier.size() != len || memcmp(server_signature.data(), verifier.data(), len) != 0) {
+                throw std::runtime_error{"bad server signature"};
+            }
+            co_await get_auth_message<authentication_ok>(s);
+            break;
+        }
+        default:
+            throw std::runtime_error{"unknown auth: "s};
+        }
+    }
+    template <typename Type>
+    task<message> get_auth_message(ip::tcp::socket &s) {
+        auto m = co_await get_message<Type>(s);
+        auto &a = m.get<Type>();
+        if (Type{}.auth_type != std::byteswap(a.auth_type)) {
+            throw std::runtime_error{"unexpected auth message: "s + (char)m.h.type};
+        }
+        co_return m;
+    }
+    template <typename Type>
+    task<message> get_message(ip::tcp::socket &s) {
         auto m = co_await get_message(s);
-        std::variant<Types...> ret;
-        auto f = [&](auto t) {
-            if (t.type != m.h.type) {
-                return false;
-            }
-            auto &a = m.get<authentication_ok>();
-            if (t.auth_type != std::byteswap(a.auth_type)) {
-                return false;
-            }
-            ret = t;
-
-            auto &a2 = m.get<authentication_sasl>();
-            auto vec = a2.authentication_mechanism();
-
-            return true;
-        };
-        if (!(f(Types{}) || ... || false)) {
+        auto &a = m.get<Type>();
+        if (Type{}.type != m.h.type) {
             throw std::runtime_error{"unexpected message: "s + (char)m.h.type};
         }
-        co_return ret;
+        co_return m;
     }
     task<message> get_message(ip::tcp::socket &s) {
         message m;
         co_await s.async_receive(boost::asio::buffer(&m.h, sizeof(m.h)), boost::asio::use_awaitable);
         m.h.length = std::byteswap(m.h.length);
-        m.data.resize(m.h.length - sizeof(m.h.length));
-        co_await s.async_receive(boost::asio::buffer(m.data.data(), m.data.size()), boost::asio::use_awaitable);
+        m.data.resize(m.h.length + 1);
+        memcpy(m.data.data(), &m.h, sizeof(header));
+        co_await s.async_receive(boost::asio::buffer(m.data.data() + sizeof(header), m.h.length - sizeof(m.h.length)), boost::asio::use_awaitable);
         error_response e{};
         if (m.h.type == e.type) {
-            throw std::runtime_error{"error: "};
+            auto e = m.get<error_response>().error();
+            std::cerr << e.format() << "\n";
+            throw std::runtime_error{std::format("error: {}"s, e.format())};
         }
         co_return m;
     }
 };
 
-struct base64 {
-    using u8 = unsigned char;
-    struct b64 {
-        u8 b2 : 2;
-        u8 a  : 6;
-        u8 c1 : 4;
-        u8 b1 : 4;
-        u8 d  : 6;
-        u8 c2 : 2;
-
-        template <auto N> constexpr void extract(auto &s) {
-            // url safe -_
-            constexpr auto alph = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"sv;
-
-            s += alph[a];
-            s += alph[b1 + (b2 << 4)];
-            if constexpr (N > 2)
-            s += alph[(c1 << 2) + c2];
-            else
-            s += '=';
-            if constexpr (N > 3)
-            s += alph[d];
-            else
-            s += '=';
-        }
-        template <auto N> constexpr void assign(auto data) {
-            constexpr u8 alph[] = {
-                 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-                 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 62,
-                 255, 255, 255, 63,  52,  53,  54,  55,  56,  57,  58,  59,  60,  61,  255, 255, 255, 254, 255, 255, 255, 0,
-                 1,   2,   3,   4,   5,   6,   7,   8,   9,   10,  11,  12,  13,  14,  15,  16,  17,  18,  19,  20,  21,  22,
-                 23,  24,  25,  255, 255, 255, 255, 255, 255, 26,  27,  28,  29,  30,  31,  32,  33,  34,  35,  36,  37,  38,
-                 39,  40,  41,  42,  43,  44,  45,  46,  47,  48,  49,  50,  51,  255, 255, 255, 255, 255};
-
-            b2 = alph[data[1]] >> 4;
-            a  = alph[data[0]];
-            if constexpr (N > 2)
-            c1 = alph[data[2]] >> 2;
-            b1 = alph[data[1]];
-            if constexpr (N > 3)
-            d  = alph[data[3]];
-            if constexpr (N > 2)
-            c2 = alph[data[2]];
-        }
-    };
-    static_assert(sizeof(b64) == 3);
-    static inline constexpr auto b64size = 3;
-    static inline constexpr auto b64chars = 4;
-
-    static auto encode(auto &&data) {
-        auto sz = data.size();
-        std::string s;
-        if (sz == 0) {
-            return s;
-        }
-        s.reserve((sz / b64size + (sz % b64size ? 1 : 0)) * b64chars);
-        auto until = sz - sz % b64size;
-        auto p = (b64*)data.data();
-        int i{};
-        for (; i < until; i += b64size) {
-            p++->extract<b64chars>(s);
-        }
-        auto tail = sz - i;
-        if (tail == 1) {
-            p->extract<b64chars-2>(s);
-        } else if (tail == 2) {
-            p->extract<b64chars-1>(s);
-        }
-        return s;
-    }
-    static auto decode(auto &&data) {
-        auto sz = data.size();
-        if (sz % b64chars) {
-            throw std::runtime_error{"bad base64: incorrect length"};
-        }
-        std::string s;
-        if (sz == 0) {
-            return s;
-        }
-        s.resize(sz / b64chars * b64size);
-        sz -= data[sz-1] == '=';
-        sz -= data[sz-1] == '=';
-        auto p = (b64*)s.data();
-        int i{};
-        for (; i < sz; i += b64chars) {
-            p++->assign<b64chars>(&data[i]);
-        }
-        auto tail = i - sz;
-        if (tail == 2) {
-            p->assign<b64chars-2>(&data[i]);
-        } else if (tail == 1) {
-            p->assign<b64chars-1>(&data[i]);
-        }
-        s.resize(s.size() - tail);
-        return s;
-    }
-};
-inline std::string operator""_b64e(const char *s, size_t len) {
-    return base64::encode(std::string_view{s,len});
-}
-inline std::string operator""_b64d(const char *s, size_t len) {
-    return base64::decode(std::string_view{s,len});
-}
-
 int main(int argc, char *argv[]) {
-    auto x1 = base64::encode("Many hands make light work."s);
-    auto x2 = base64::encode("Many hands make light work.."s);
-    auto x3 = base64::encode("Many hands make light work..."s);
-    auto x4 = "Many hands make light work."_b64e;
-
-    auto y1 = base64::decode(x1);
-    auto y2 = base64::decode(x2);
-    auto y3 = base64::decode(x3);
-    auto y4 = "TWFueSBoYW5kcyBtYWtlIGxpZ2h0IHdvcmsu"_b64d;
-
     boost::asio::io_context ctx;
     pg_connection conn(ctx, "host=localhost user=aspia_public_router password=aspia_public_router dbname=aspia_public_router");
     ctx.run();

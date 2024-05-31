@@ -30,6 +30,7 @@ void build(Solution &s) {
             ;*/
 
         //t += router_relay;
+        t += "pub.egorpugin.crypto"_dep;
         t += "pub.egorpugin.primitives.templates2"_dep;
         t.Public += "org.sw.demo.boost.asio"_dep;
         t += "pub.egorpugin.primitives.sw.main"_dep;

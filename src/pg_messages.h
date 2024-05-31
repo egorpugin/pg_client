@@ -16,7 +16,7 @@ struct message {
 
     template <typename T>
     T &get() {
-        return *(T*)(data.data() - sizeof(h));
+        return *(T*)(data.data());
     }
 };
 
@@ -104,7 +104,13 @@ struct authentication_sasl_continue {
     i8 type{'R'};
     i32 length;
     i32 auth_type{11};
-    i8 *sasl_data_specific_to_the_sasl_mechanism_being_used;
+    //i8 *sasl_data_specific_to_the_sasl_mechanism_being_used;
+
+    auto server_data() const {
+        auto base = (const char *)&auth_type + sizeof(auth_type);
+        std::string_view v{base, base + length - sizeof(length) - sizeof(auth_type)};
+        return v;
+    }
 };
 
 struct authentication_sasl_final {
@@ -113,7 +119,13 @@ struct authentication_sasl_final {
     i8 type{'R'};
     i32 length;
     i32 auth_type{12};
-    i8 *sasl_outcome_additional_data__specific_to_the_sasl_mechanism_being_used;
+    //i8 *sasl_outcome_additional_data__specific_to_the_sasl_mechanism_being_used;
+
+    auto server_data() const {
+        auto base = (const char *)&auth_type + sizeof(auth_type);
+        std::string_view v{base, base + length - sizeof(length) - sizeof(auth_type)};
+        return v;
+    }
 };
 
 struct backend_key_data {
@@ -262,13 +274,71 @@ struct empty_query_response {
     i32 length{4};
 };
 
+// https://www.postgresql.org/docs/current/protocol-error-fields.html
 struct error_response {
     static constexpr inline bool backend_type = true;
 
     i8 type{'E'};
     i32 length;
-    i8 a_code_identifying_the_field_type_if_zero_this_is_the_message_terminator_and_no_string_follows;
-    std::string the_field_value;
+    //i8 a_code_identifying_the_field_type_if_zero_this_is_the_message_terminator_and_no_string_follows;
+    //std::string the_field_value;
+
+    struct error1 {
+        std::string_view severity_localized;
+        std::string_view severity;
+        std::string_view code;
+        std::string_view message;
+        std::string_view detail;
+        std::string_view hint;
+        std::string_view position;
+        std::string_view internal_position;
+        std::string_view internal_query;
+        std::string_view where;
+        std::string_view schema;
+        std::string_view table;
+        std::string_view column;
+        std::string_view data_type;
+        std::string_view constraint;
+        std::string_view file;
+        std::string_view line;
+        std::string_view routine;
+
+        std::string format() const {
+            return std::format("{}: {}: {}: {}\n{}:{}: {}()", severity, code, message, detail, file, line, routine);
+        }
+    };
+
+    auto error() const {
+        auto base = (const char *)&length + sizeof(length);
+        error1 e;
+        while (*base) {
+            auto code = *base++;
+            std::string_view sv{base};
+            switch (code) {
+                case 'S': e.severity_localized = sv; break;
+                case 'V': e.severity = sv; break;
+                case 'C': e.code = sv; break;
+                case 'M': e.message = sv; break;
+                case 'D': e.detail = sv; break;
+                case 'H': e.hint = sv; break;
+                case 'P': e.position = sv; break;
+                case 'p': e.internal_position = sv; break;
+                case 'q': e.internal_query = sv; break;
+                case 'W': e.where = sv; break;
+                case 's': e.schema = sv; break;
+                case 't': e.table = sv; break;
+                case 'c': e.column = sv; break;
+                case 'd': e.data_type = sv; break;
+                case 'n': e.constraint = sv; break;
+                case 'F': e.file = sv; break;
+                case 'L': e.line = sv; break;
+                case 'R': e.routine = sv; break;
+                default: break;
+            }
+            base += sv.size() + 1;
+        }
+        return e;
+    }
 };
 
 struct execute {
@@ -448,9 +518,9 @@ struct sasl_initial_response {
 
     i8 type{'p'};
     i32 length;
-    std::string name_of_the_sasl_authentication_mechanism_that_the_client_selected;
-    i32 length2;
-    i8 *sasl_mechanism_specific__initial_response_;
+    //std::string name_of_the_sasl_authentication_mechanism_that_the_client_selected;
+    //i32 length2;
+    //i8 *sasl_mechanism_specific__initial_response_;
 };
 
 struct sasl_response {
@@ -458,7 +528,7 @@ struct sasl_response {
 
     i8 type{'p'};
     i32 length;
-    i8 *sasl_mechanism_specific_message_data;
+    //i8 *sasl_mechanism_specific_message_data;
 };
 
 struct ssl_request {
@@ -472,7 +542,7 @@ struct startup_message {
     static constexpr inline bool frontend_type = true;
 
     i32 length;
-    i32 the_protocol_version_number{196608};
+    i32 the_protocol_version_number{0x030000};
     std::string the_parameter_name;
     std::string the_parameter_value;
 };
