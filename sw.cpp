@@ -1,5 +1,5 @@
 void build(Solution &s) {
-    /*auto &pg_message_formats_parser = s.addExecutable("pg_message_formats_parser");
+    auto &pg_message_formats_parser = s.addExecutable("pg_message_formats_parser");
     {
         auto &t = pg_message_formats_parser;
         t += cpp26;
@@ -13,7 +13,7 @@ void build(Solution &s) {
         t += "org.sw.demo.zeux.pugixml"_dep;
         t += "org.sw.demo.htacg.tidy_html5"_dep;
         t += "org.sw.demo.boost.pfr"_dep;
-    }*/
+    }
 
     auto &pg_client = s.addExecutable("pg_client");
     {

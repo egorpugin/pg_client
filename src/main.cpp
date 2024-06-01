@@ -48,26 +48,9 @@ struct pg_connection {
         ip::tcp::socket s{ex};
         co_await s.async_connect(e, boost::asio::use_awaitable);
 
-        std::vector<boost::asio::const_buffer> buffers;
-        i32 length{};
-        auto version = startup_message{}.the_protocol_version_number;
-        version = std::byteswap(version);
-        buffers.emplace_back(&length, sizeof(length));
-        buffers.emplace_back(&version, sizeof(version));
-        for (auto &&[k,v] : params) {
-            if (k == "user") {
-                buffers.emplace_back(k.data(), k.size() + 1);
-                buffers.emplace_back(v.data(), v.size() + 1);
-            }
-        }
         i8 null{};
-        buffers.emplace_back(&null, sizeof(null));
-        for (auto &&b : buffers) {
-            length += b.size();
-        }
-        length = std::byteswap(length);
-
-        co_await s.async_send(buffers, boost::asio::use_awaitable);
+        auto u = "user"sv;
+        co_await send_message<startup_message>(s, zero_byte{u}, zero_byte{params.at("user"s)}, null);
         co_await auth(s);
 
         while (1) {
@@ -80,17 +63,59 @@ struct pg_connection {
             }
         }
 
+        auto q = "SELECT 1;"sv;
+        co_await send_message<query>(s, zero_byte{q});
+        while (1) {
+            auto m = co_await get_message(s);
+            if (ready_for_query{}.type == m.h.type) {
+                break;
+            }
+        }
+
+        // not working for some reason
+        auto portal_name = "test123"sv;
+        //auto portal = zero_byte{portal_name};
+        auto portal = null;
+        auto empty_prepared_statement = null;
+        i16 zero_params{};
+        co_await send_message<parse>(s, empty_prepared_statement, zero_byte{q}, zero_params);
+        //co_await get_message<parse_complete>(s);
+        co_await send_message<struct bind>(s,
+            portal,
+            empty_prepared_statement,
+            zero_params,
+            //
+            zero_params,
+            //
+            // result column format codes
+            zero_params
+        );
+        //co_await get_message<bind_complete>(s);
+        co_await send_message<describe>(s, 'P', portal);
+        //auto rd = co_await get_message<row_description>(s);
+        i32 zero_rows{};
+        co_await send_message<execute>(s, portal, zero_rows);
+        co_await send_message<struct close>(s, 'P', portal);
+        //co_await get_message<close_complete>(s);
+        co_await send_message<sync>(s);
+
+        while (1) {
+            auto m = co_await get_message(s);
+            if (ready_for_query{}.type == m.h.type) {
+                break;
+            }
+        }
+
         int a = 5;
         a++;
     }
     task<> auth(ip::tcp::socket &s) {
         auto m = co_await get_message<authentication_ok>(s);
         auto &a = m.get<authentication_ok>();
-        switch (std::byteswap(a.auth_type)) {
-        case authentication_ok{}.auth_type: {
+        switch (a.auth_type_) {
+        case authentication_ok::auth_type:
             break;
-        }
-        case authentication_sasl{}.auth_type: {
+        case authentication_sasl::auth_type: {
             // https://www.rfc-editor.org/rfc/rfc5802
             auto &a = m.get<authentication_sasl>();
             auto type = a.authentication_mechanism().at(0);
@@ -107,9 +132,8 @@ struct pg_connection {
             auto user_data = "n=,r=" + base64::encode(r);
             str += channel + user_data;
 
-            int len = str.size();
-            len = std::byteswap(len);
-            co_await send_message<sasl_initial_response>(s, zero_byte{type}, len, no_zero_byte{str});
+            be_i32 strsz = str.size();
+            co_await send_message<sasl_initial_response>(s, zero_byte{type}, strsz, no_zero_byte{str});
             auto sc = co_await get_auth_message<authentication_sasl_continue>(s);
             auto &asc = sc.get<authentication_sasl_continue>();
             auto sd = asc.server_data();
@@ -145,15 +169,13 @@ struct pg_connection {
             auto salted_password = Hi(this->params["password"], salt, std::stoi(std::string{params.at("i")}));
             auto client_key = hmac<sha256>(salted_password, "Client Key"sv);
             auto server_key = hmac<sha256>(salted_password, "Server Key"sv);
-            sha256 sha;
-            sha.update(client_key);
-            auto stored_key = sha.digest();
+            auto stored_key = sha256::digest(client_key);
             auto new_client = "c=" + base64::encode(channel) + ",r=" + params.at("r");
             auto auth_message = user_data + ","s + std::string{sd} + ","s + new_client;
             auto client_signature = hmac<sha256>(stored_key, auth_message);
             auto server_signature = hmac<sha256>(server_key, auth_message);
             auto client_proof = client_key;
-            len = client_proof.size();
+            auto len = client_proof.size();
             for (int i = 0; i < len; ++i) {
                 client_proof[i] ^= client_signature[i];
             }
@@ -184,12 +206,6 @@ struct pg_connection {
         }
     }
     template <typename Type>
-    task<> send_message(ip::tcp::socket &s, Type message) {
-        message.length = sizeof(message) - 1;
-        message.length = std::byteswap(message.length);
-        co_await s.async_send(boost::asio::buffer(&message, sizeof(message)), boost::asio::use_awaitable);
-    }
-    template <typename Type>
     task<> send_message(ip::tcp::socket &s, auto && ... args) {
         i8 zero{};
         Type message{};
@@ -210,14 +226,13 @@ struct pg_connection {
         if constexpr (requires {message.type;}) {
             --message.length;
         }
-        message.length = std::byteswap(message.length);
         co_await s.async_send(buffers, boost::asio::use_awaitable);
     }
     template <typename Type>
     task<message> get_auth_message(ip::tcp::socket &s) {
         auto m = co_await get_message<Type>(s);
         auto &a = m.get<Type>();
-        if (Type{}.auth_type != std::byteswap(a.auth_type)) {
+        if (Type::auth_type != a.auth_type_) {
             throw std::runtime_error{"unexpected auth message: "s + (char)m.h.type};
         }
         co_return m;
@@ -234,7 +249,6 @@ struct pg_connection {
     task<message> get_message(ip::tcp::socket &s) {
         message m;
         co_await s.async_receive(boost::asio::buffer(&m.h, sizeof(m.h)), boost::asio::use_awaitable);
-        m.h.length = std::byteswap(m.h.length);
         m.data.resize(m.h.length + 1);
         memcpy(m.data.data(), &m.h, sizeof(header));
         co_await s.async_receive(boost::asio::buffer(m.data.data() + sizeof(header), m.h.length - sizeof(m.h.length)), boost::asio::use_awaitable);
@@ -242,7 +256,7 @@ struct pg_connection {
         if (m.h.type == e.type) {
             auto e = m.get<error_response>().error();
             std::cerr << e.format() << "\n";
-            throw std::runtime_error{std::format("error: {}"s, e.format())};
+            throw std::runtime_error{std::format("error: {}"sv, e.format())};
         }
         co_return m;
     }

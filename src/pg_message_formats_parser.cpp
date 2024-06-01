@@ -81,6 +81,14 @@ struct field {
     std::string type;
     std::string comment;
 
+    auto get_default_value() const {
+        std::string s;
+        auto p = type.find('(');
+        if (p == -1) {
+            return s;
+        }
+        return type.substr(p + 1, type.find(')') - (p+1));
+    }
     auto emit() const {
         auto type = prepare_string(this->type);
 
@@ -90,10 +98,10 @@ struct field {
             if (p == -1) {
                 return s;
             }
-            return "{" + type.substr(p + 1, type.find(')') - (p+1)) + "}";
+            return "{" + get_default_value() + "}";
         };
 
-        auto v = get_val();
+        auto v = get_default_value();
         std::string s;
         if (type.starts_with("Byte")) {
             try {
@@ -243,13 +251,14 @@ struct parser {
 int main(int argc, char *argv[]) {
     parser p;
     auto ts = p.parse();
-    std::string raw, c;
+    std::string raw, c, switch_;
     for (auto &&t : ts) {
         raw += std::format("{}\n", t.name);
         for (auto &&f : t.fields) {
             raw += std::format("\t{}\n", f.type);
             raw += std::format("\t\t{}\n", f.comment);
         }
+        //switch_ += std::format("case {}: \n", t.emit());
         raw += "\n";
         c += std::format("{}\n", t.emit());
     }
