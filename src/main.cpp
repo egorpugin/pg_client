@@ -1,6 +1,7 @@
 #include <boost/asio.hpp>
 #include <primitives/sw/main.h>
 #include <primitives/templates2/base64.h>
+#include <primitives/templates2/overload.h>
 #include <hmac.h>
 
 #include <string>
@@ -15,7 +16,20 @@ using task = boost::asio::awaitable<T>;
 #include "pg_messages.h"
 
 struct pg_connection {
+    struct view_base {
+        const i8 *d;
+        size_t sz;
+
+        view_base(auto &d) : d{(const i8 *)d.data()}, sz{d.size()} {}
+
+        auto data() const {return d;}
+        auto size() const {return sz;}
+    };
+    struct zero_byte : view_base {};
+    struct no_zero_byte : view_base {};
+
     std::map<std::string, std::string> params;
+    backend_key_data key_data;
 
     pg_connection(boost::asio::io_context &ctx, auto &&connstr) {
         auto vec = split_string(connstr, " ");
@@ -58,6 +72,9 @@ struct pg_connection {
 
         while (1) {
             auto m = co_await get_message(s);
+            if (backend_key_data{}.type == m.h.type) {
+                key_data = m.get<backend_key_data>();
+            }
             if (ready_for_query{}.type == m.h.type) {
                 break;
             }
@@ -70,7 +87,11 @@ struct pg_connection {
         auto m = co_await get_message<authentication_ok>(s);
         auto &a = m.get<authentication_ok>();
         switch (std::byteswap(a.auth_type)) {
+        case authentication_ok{}.auth_type: {
+            break;
+        }
         case authentication_sasl{}.auth_type: {
+            // https://www.rfc-editor.org/rfc/rfc5802
             auto &a = m.get<authentication_sasl>();
             auto type = a.authentication_mechanism().at(0);
             if (type != "SCRAM-SHA-256"sv) {
@@ -79,23 +100,16 @@ struct pg_connection {
             std::string r;
             r.resize(18, '0');
             std::string str;
+            // no channel binding
+            auto channel = "n,,"s;
             // pg ignores user and libpq sends empty username
-            str += "n,,n=,r=" + base64::encode(r);
+            // pg (and libpq) uses empty user (n=) because username is already sent
+            auto user_data = "n=,r=" + base64::encode(r);
+            str += channel + user_data;
 
-            sasl_initial_response resp{};
-            std::vector<boost::asio::const_buffer> buffers;
-            buffers.emplace_back(&resp, sizeof(resp));
-            buffers.emplace_back(type.data(), type.size() + 1);
             int len = str.size();
             len = std::byteswap(len);
-            buffers.emplace_back(&len, sizeof(len));
-            buffers.emplace_back(str.data(), str.size());
-            for (auto &&b : buffers) {
-                resp.length += b.size();
-            }
-            --resp.length;
-            resp.length = std::byteswap(resp.length);
-            co_await s.async_send(buffers, boost::asio::use_awaitable);
+            co_await send_message<sasl_initial_response>(s, zero_byte{type}, len, no_zero_byte{str});
             auto sc = co_await get_auth_message<authentication_sasl_continue>(s);
             auto &asc = sc.get<authentication_sasl_continue>();
             auto sd = asc.server_data();
@@ -109,7 +123,6 @@ struct pg_connection {
                 params[v.substr(0,p)] = v.substr(p+1);
             }
 
-            // https://www.rfc-editor.org/rfc/rfc5802
             using namespace crypto;
             auto salt = base64::decode(params.at("s"));
             auto Hi = [](auto &&pass, auto &&salt, auto &&i) {
@@ -135,9 +148,8 @@ struct pg_connection {
             sha256 sha;
             sha.update(client_key);
             auto stored_key = sha.digest();
-            auto new_client = "c=" + base64::encode("n,,"s) + ",r=" + params.at("r");
-            // pg (and libpq) uses empty user (n=) because username is already sent
-            auto auth_message = "n=,r=" + base64::encode(r) + ","s + std::string{sd} + ","s + new_client;
+            auto new_client = "c=" + base64::encode(channel) + ",r=" + params.at("r");
+            auto auth_message = user_data + ","s + std::string{sd} + ","s + new_client;
             auto client_signature = hmac<sha256>(stored_key, auth_message);
             auto server_signature = hmac<sha256>(server_key, auth_message);
             auto client_proof = client_key;
@@ -147,13 +159,7 @@ struct pg_connection {
             }
             new_client += ",p=" + base64::encode(client_proof);
 
-            sasl_response resp2{};
-            buffers.clear();
-            buffers.emplace_back(&resp2, sizeof(resp2));
-            buffers.emplace_back(new_client.data(), new_client.size());
-            resp2.length = sizeof(resp2.length) + new_client.size();
-            resp2.length = std::byteswap(resp2.length);
-            co_await s.async_send(buffers, boost::asio::use_awaitable);
+            co_await send_message<sasl_response>(s, no_zero_byte{new_client});
             auto scf = co_await get_auth_message<authentication_sasl_final>(s);
             auto &asf = scf.get<authentication_sasl_final>();
             sd = asf.server_data();
@@ -176,6 +182,36 @@ struct pg_connection {
         default:
             throw std::runtime_error{"unknown auth: "s};
         }
+    }
+    template <typename Type>
+    task<> send_message(ip::tcp::socket &s, Type message) {
+        message.length = sizeof(message) - 1;
+        message.length = std::byteswap(message.length);
+        co_await s.async_send(boost::asio::buffer(&message, sizeof(message)), boost::asio::use_awaitable);
+    }
+    template <typename Type>
+    task<> send_message(ip::tcp::socket &s, auto && ... args) {
+        i8 zero{};
+        Type message{};
+        std::vector<boost::asio::const_buffer> buffers;
+        buffers.emplace_back(&message, sizeof(message));
+        auto f = overload([&](const no_zero_byte &v) {
+            buffers.emplace_back(v.data(), v.size());
+        },[&](const zero_byte &v) {
+            buffers.emplace_back(v.data(), v.size());
+            buffers.emplace_back(&zero, sizeof(zero));
+        },[&](const auto &v) {
+            buffers.emplace_back(&v, sizeof(v));
+        });
+        (f(args),...);
+        for (auto &&b : buffers) {
+            message.length += b.size();
+        }
+        if constexpr (requires {message.type;}) {
+            --message.length;
+        }
+        message.length = std::byteswap(message.length);
+        co_await s.async_send(buffers, boost::asio::use_awaitable);
     }
     template <typename Type>
     task<message> get_auth_message(ip::tcp::socket &s) {

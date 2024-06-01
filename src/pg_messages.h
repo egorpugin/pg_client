@@ -5,6 +5,10 @@ using i16 = short;
 using i32 = int;
 
 #pragma pack(push, 1)
+template <typename T>
+struct be {
+};
+
 struct header {
     i8 type;
     i32 length;
@@ -543,8 +547,8 @@ struct startup_message {
 
     i32 length;
     i32 the_protocol_version_number{0x030000};
-    std::string the_parameter_name;
-    std::string the_parameter_value;
+    //std::string the_parameter_name;
+    //std::string the_parameter_value;
 };
 
 struct sync {
