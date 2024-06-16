@@ -73,7 +73,7 @@ struct pg_connection {
         }
 
         // not working for some reason
-        auto portal_name = "test123"sv;
+        /*auto portal_name = "test123"sv;
         //auto portal = zero_byte{portal_name};
         auto portal = null;
         auto empty_prepared_statement = null;
@@ -104,7 +104,7 @@ struct pg_connection {
             if (ready_for_query{}.type == m.h.type) {
                 break;
             }
-        }
+        }*/
 
         int a = 5;
         a++;
@@ -149,24 +149,7 @@ struct pg_connection {
 
             using namespace crypto;
             auto salt = base64::decode(params.at("s"));
-            auto Hi = [](auto &&pass, auto &&salt, auto &&i) {
-                int i1{1};
-                i1 = std::byteswap(i1);
-                salt.resize(salt.size() + 4);
-                memcpy(salt.data() + salt.size() - 4, &i1, 4);
-                auto u = hmac<sha256>(pass, salt);
-                --i;
-                auto hi = u;
-                auto len = hi.size();
-                while (i--) {
-                    u = hmac<sha256>(pass, u);
-                    for (int i = 0; i < len; ++i) {
-                        hi[i] ^= u[i];
-                    }
-                }
-                return hi;
-            };
-            auto salted_password = Hi(this->params["password"], salt, std::stoi(std::string{params.at("i")}));
+            auto salted_password = pbkdf2<sha256>(this->params["password"], salt, std::stoi(std::string{params.at("i")}));
             auto client_key = hmac<sha256>(salted_password, "Client Key"sv);
             auto server_key = hmac<sha256>(salted_password, "Server Key"sv);
             auto stored_key = sha256::digest(client_key);
