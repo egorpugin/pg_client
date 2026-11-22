@@ -158,6 +158,9 @@ struct pg_connection {
                 }
                 params[v.substr(0,p)] = v.substr(p+1);
             }
+            if (!params.at("r").starts_with(rbase64)) {
+                throw std::runtime_error{"bad server salt"};
+            }
 
             using namespace crypto;
             auto salt = base64::decode(params.at("s"));
