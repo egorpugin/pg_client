@@ -164,7 +164,11 @@ struct pg_connection {
 
             using namespace crypto;
             auto salt = base64::decode(params.at("s"));
-            auto salted_password = pbkdf2<sha256>(this->params["password"], salt, std::stoi(std::string{params.at("i")}));
+            auto c = std::stoi(std::string{params.at("i")});
+            if (c < 1) {
+                throw std::runtime_error{"bad pbkdf2 count"};
+            }
+            auto salted_password = pbkdf2<sha256>(this->params["password"], salt, c);
             auto client_key = hmac<sha256>(salted_password, "Client Key"sv);
             auto server_key = hmac<sha256>(salted_password, "Server Key"sv);
             auto stored_key = sha256::digest(client_key);
