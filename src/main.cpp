@@ -3,6 +3,7 @@
 #include <primitives/templates2/base64.h>
 #include <primitives/templates2/overload.h>
 #include <hmac.h>
+#include <random.h>
 
 #include <string>
 #include <variant>
@@ -132,13 +133,15 @@ struct pg_connection {
                 throw std::runtime_error{"unknown sasl: "s};
             }
             std::string r;
-            r.resize(18, '0');
+            r.resize(18);
+            crypto::get_random_secure_bytes(r);
+            auto rbase64 = base64::encode(r);
             std::string str;
             // no channel binding
             auto channel = "n,,"s;
             // pg ignores user and libpq sends empty username
             // pg (and libpq) uses empty user (n=) because username is already sent
-            auto user_data = "n=,r=" + base64::encode(r);
+            auto user_data = "n=,r=" + rbase64;
             str += channel + user_data;
 
             be_i32 strsz = str.size();
