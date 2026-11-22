@@ -40,7 +40,16 @@ struct pg_connection {
             }
             params[v.substr(0,p)] = v.substr(p+1);
         }
-        boost::asio::co_spawn(ctx, start(), boost::asio::detached);
+        boost::asio::co_spawn(ctx, start(), [](auto &&eptr){
+            if (!eptr) {
+                return;
+            }
+            try {
+                std::rethrow_exception(eptr);
+            } catch (std::exception &e) {
+                std::cerr << e.what();
+            }
+        });
     }
     task<> start() {
         auto ex = co_await boost::asio::this_coro::executor;
